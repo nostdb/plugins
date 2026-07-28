@@ -55,12 +55,16 @@ State both honestly. A range wider than you have tested is a promise you have no
 A plugin is installed from GitHub:
 
 ```text
-https://github.com/<owner>/<repository>[?ref=<git-ref>][#<subdirectory>]
+https://github.com/<owner>/<repository>?ref=<git-ref>[#<subdirectory>]
 ```
 
-With no ref, the manager resolves the default branch **once** and records the commit. Your
-users do not follow your branch: they pin what they installed, and moving your branch does
-not move them. That is deliberate, and it means a fix reaches them only when they ask for it.
+The ref is **required**, and it is resolved once to a commit. Your users do not follow your
+branch: they pin what they installed, and moving your branch does not move them. That is
+deliberate, and it means a fix reaches them only when they ask for it.
+
+So publish a tag and tell people to install it by name. `?ref=v1.2.0` in an install command is
+a record of what somebody got that they can read without opening a lock file; `?ref=main` is a
+commit they will not be able to identify later without one.
 
 One repository may hold several plugins, each in its own subdirectory.
 
