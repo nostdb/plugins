@@ -31,6 +31,39 @@ if [ -e docs/PRD.md ] || [ -e grammar ] || [ -e fixtures ]; then
   exit 1
 fi
 
+# The reference viewer is an executable, so it can be wrong in ways a manifest cannot.
+#
+# Checked by parsing rather than by running. This repository must never execute a plugin's code,
+# and that rule is not relaxed for the one plugin it happens to own: a rule that holds except for
+# the code you wrote yourself is not a rule. What that leaves unverified is recorded in the root
+# IMPLEMENTATION_PROGRESS.md rather than papered over.
+viewer=reference/view-webgpu/bin/nostdb-view
+if [ ! -x "$viewer" ]; then
+  echo "$viewer must be committed executable; an entrypoint nothing can start is not one" >&2
+  exit 1
+fi
+if ! head -1 "$viewer" | grep -q '^#!'; then
+  echo "$viewer must name its interpreter, because an entrypoint is never run through a shell" >&2
+  exit 1
+fi
+if command -v node >/dev/null 2>&1; then
+  node --check "$viewer" || { echo "$viewer does not parse" >&2; exit 1; }
+  echo "reference viewer: parses, and is executable"
+else
+  echo "reference viewer: node is absent, so it was not parsed" >&2
+fi
+
+# A viewer that claimed WebGPU or a performance tier would be claiming something nobody measured.
+# The positive form again: the document a user reads must say what it does not do.
+if ! grep -q 'Canvas 2D' reference/view-webgpu/README.md; then
+  echo "the reference viewer must say what it renders with" >&2
+  exit 1
+fi
+if ! grep -q 'no claim about any performance tier' reference/view-webgpu/README.md; then
+  echo "the reference viewer must state that it claims no performance tier" >&2
+  exit 1
+fi
+
 # The root contract forbids claiming a sandbox that is not implemented.
 #
 # Checked as a *positive* requirement rather than by searching for the claim. A grep for

@@ -1,0 +1,513 @@
+#!/usr/bin/env node
+// The reference NostDB viewer.
+//
+// It speaks plugin_protocol_version 1 on stdin and stdout, decodes the
+// view_exchange_version 1 artifact it is handed, and writes an HTML page that draws the graph.
+//
+// # What this is, and what it is not
+//
+// It is a reference: it exists to prove the exchange format carries what a viewer needs, and to
+// give an author a complete working plugin to read. Every section is decoded and every one is
+// used, so a format that had left something out would show up here as something missing.
+//
+// It renders with Canvas 2D. It does **not** use WebGPU, does not implement instanced rendering,
+// compute-assisted layout, level of detail, clustering, edge aggregation, or label culling, and
+// makes no claim about any performance tier. The product contract requires all of those of a
+// viewer meant for large graphs; this is not that viewer, and saying otherwise would be a
+// promise nobody had measured.
+//
+// It is not sandboxed. It runs as the user who invoked it, with their files.
+
+import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { join, dirname } from "node:path";
+import { createHash } from "node:crypto";
+import { createInterface } from "node:readline";
+
+const PROTOCOL_VERSION = 1;
+const EXCHANGE_VERSION = 1;
+const MEDIA_TYPE = "application/vnd.nostdb.view+bin";
+const NAME = "org.nostdb.view-webgpu";
+const VERSION = "0.1.0";
+const MAGIC = "NOSTVIEW";
+
+// What this build will draw. Beyond it the contract requires VIEW_CAPACITY_EXCEEDED rather than a
+// crash — a fact about this renderer on this machine, never about the file.
+const MAX_DRAWABLE_NODES = 20000;
+const MAX_DRAWABLE_EDGES = 100000;
+
+const SECTION = {
+  STRINGS: 1,
+  NODE_IDS: 2,
+  NODE_LABELS: 3,
+  NODE_SOURCES: 4,
+  EDGE_ENDPOINTS: 5,
+  EDGE_RELATIONS: 6,
+  SOURCES: 7,
+  EVIDENCE: 8,
+};
+
+const CRC_TABLE = (() => {
+  const table = new Uint32Array(256);
+  for (let index = 0; index < 256; index += 1) {
+    let value = index;
+    for (let bit = 0; bit < 8; bit += 1) {
+      value = value & 1 ? (value >>> 1) ^ 0x82f63b78 : value >>> 1;
+    }
+    table[index] = value >>> 0;
+  }
+  return table;
+})();
+
+function crc32c(bytes) {
+  let crc = 0xffffffff;
+  for (const byte of bytes) crc = CRC_TABLE[(crc ^ byte) & 0xff] ^ (crc >>> 8);
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+/** A refusal that carries a registered code. Thrown, and turned into an error reply by the caller. */
+class Refusal extends Error {
+  constructor(code, message) {
+    super(message);
+    this.code = code;
+  }
+}
+
+/**
+ * Decodes an exchange container.
+ *
+ * Bounds are applied before anything is allocated on a count read from the file, because a count
+ * read from a file is a number somebody else chose.
+ */
+function decode(bytes) {
+  const invalid = (why) => new Refusal("VIEW_EXCHANGE_INVALID", why);
+  if (bytes.length < 32) throw invalid("shorter than its own header");
+  if (bytes.subarray(0, 8).toString("ascii") !== MAGIC) throw invalid("the magic is not NOSTVIEW");
+
+  const version = bytes.readUInt16LE(8);
+  if (version !== EXCHANGE_VERSION) throw invalid(`view_exchange_version ${version}`);
+  if (crc32c(bytes.subarray(0, 24)) !== bytes.readUInt32LE(24)) {
+    throw invalid("the header checksum does not match");
+  }
+  if (bytes.readUInt32LE(28) !== 0) throw invalid("the reserved field is not zero");
+
+  const sectionCount = bytes.readUInt16LE(10);
+  const nodeCount = bytes.readUInt32LE(12);
+  const edgeCount = bytes.readUInt32LE(16);
+  const sourceCount = bytes.readUInt32LE(20);
+  if (sectionCount > 16) throw invalid("more sections than the bound");
+  if (nodeCount > 4194304 || edgeCount > 33554432 || sourceCount > 65536) {
+    throw invalid("a count is over its bound");
+  }
+  if (sourceCount === 0) throw invalid("there is always at least the root source");
+
+  const tableEnd = 32 + sectionCount * 16;
+  if (bytes.length < tableEnd) throw invalid("the section table runs past the end");
+
+  const sections = new Map();
+  const spans = [];
+  for (let index = 0; index < sectionCount; index += 1) {
+    const at = 32 + index * 16;
+    const kind = bytes.readUInt16LE(at);
+    if (bytes.readUInt16LE(at + 2) !== 0) throw invalid("an entry's reserved field is not zero");
+    if (kind < 1 || kind > 8) throw invalid(`section kind ${kind} is not one version 1 defines`);
+    const offset = bytes.readUInt32LE(at + 4);
+    const length = bytes.readUInt32LE(at + 8);
+    if (offset < tableEnd || offset + length > bytes.length) {
+      throw invalid(`section ${kind} lies outside the file`);
+    }
+    if (crc32c(bytes.subarray(offset, offset + length)) !== bytes.readUInt32LE(at + 12)) {
+      throw invalid(`section ${kind} does not match its checksum`);
+    }
+    if (sections.has(kind)) throw invalid(`section kind ${kind} appears twice`);
+    sections.set(kind, { offset, length });
+    spans.push([offset, offset + length, kind]);
+  }
+
+  spans.sort((left, right) => left[0] - right[0]);
+  for (let index = 1; index < spans.length; index += 1) {
+    if (spans[index - 1][1] > spans[index][0]) {
+      throw invalid(`sections ${spans[index - 1][2]} and ${spans[index][2]} overlap`);
+    }
+  }
+
+  for (const [kind, name] of [
+    [SECTION.STRINGS, "strings"],
+    [SECTION.NODE_IDS, "node_ids"],
+    [SECTION.NODE_LABELS, "node_labels"],
+    [SECTION.NODE_SOURCES, "node_sources"],
+    [SECTION.EDGE_ENDPOINTS, "edge_endpoints"],
+    [SECTION.EDGE_RELATIONS, "edge_relations"],
+    [SECTION.SOURCES, "sources"],
+  ]) {
+    if (!sections.has(kind)) throw invalid(`the required section ${name} is absent`);
+  }
+
+  for (const [kind, stride, expected] of [
+    [SECTION.NODE_IDS, 4, nodeCount],
+    [SECTION.NODE_LABELS, 4, nodeCount],
+    [SECTION.NODE_SOURCES, 4, nodeCount],
+    [SECTION.EDGE_ENDPOINTS, 8, edgeCount],
+    [SECTION.EDGE_RELATIONS, 4, edgeCount],
+    [SECTION.SOURCES, 12, sourceCount],
+  ]) {
+    if (sections.get(kind).length !== stride * expected) {
+      throw invalid(`section ${kind} disagrees with the header's counts`);
+    }
+  }
+
+  // The string table, which every other section indexes into.
+  const table = sections.get(SECTION.STRINGS);
+  const strings = [];
+  let cursor = table.offset + 4;
+  const stringCount = bytes.readUInt32LE(table.offset);
+  if (stringCount === 0) throw invalid("index 0 is the empty string, so a table always has one");
+  if (stringCount > 4194304) throw invalid("more strings than the bound");
+  const tableEndAt = table.offset + table.length;
+  for (let index = 0; index < stringCount; index += 1) {
+    if (cursor + 4 > tableEndAt) throw invalid("the string table ends inside a length");
+    const length = bytes.readUInt32LE(cursor);
+    if (length > 65536) throw invalid("a string is longer than the bound");
+    cursor += 4;
+    if (cursor + length > tableEndAt) throw invalid("a string runs past the table");
+    const text = bytes.subarray(cursor, cursor + length).toString("utf8");
+    if (index === 0 && length !== 0) throw invalid("index 0 must be the empty string");
+    strings.push(text);
+    cursor += length;
+  }
+
+  const text = (index) => {
+    if (index >= strings.length) throw invalid(`string index ${index} is out of range`);
+    return strings[index];
+  };
+
+  const column = (kind, count) => {
+    const { offset } = sections.get(kind);
+    const values = new Uint32Array(count);
+    for (let index = 0; index < count; index += 1) values[index] = bytes.readUInt32LE(offset + index * 4);
+    return values;
+  };
+
+  const nodeIds = column(SECTION.NODE_IDS, nodeCount);
+  const nodeLabels = column(SECTION.NODE_LABELS, nodeCount);
+  const nodeSources = column(SECTION.NODE_SOURCES, nodeCount);
+  for (const index of nodeSources) {
+    if (index >= sourceCount) throw invalid("a node names a source index out of range");
+  }
+
+  const endpoints = column(SECTION.EDGE_ENDPOINTS, edgeCount * 2);
+  for (const index of endpoints) {
+    if (index >= nodeCount) throw invalid("an edge endpoint is out of range");
+  }
+  const relations = column(SECTION.EDGE_RELATIONS, edgeCount);
+
+  const sourceTable = sections.get(SECTION.SOURCES);
+  const sources = [];
+  for (let index = 0; index < sourceCount; index += 1) {
+    const at = sourceTable.offset + index * 12;
+    const kind = bytes.readUInt8(at + 8);
+    const status = bytes.readUInt8(at + 9);
+    if (kind > 2 || status > 1) throw invalid("a source states an unknown kind or status");
+    if (bytes.readUInt16LE(at + 10) !== 0) throw invalid("a source's reserved field is not zero");
+    if (index === 0 && kind !== 0) throw invalid("source 0 must be the root");
+    sources.push({
+      locator: text(bytes.readUInt32LE(at)),
+      alias: text(bytes.readUInt32LE(at + 4)),
+      kind,
+      status,
+    });
+  }
+
+  // Optional, sparse, and ascending so a click can binary search it.
+  const evidence = new Map();
+  if (sections.has(SECTION.EVIDENCE)) {
+    const { offset, length } = sections.get(SECTION.EVIDENCE);
+    const count = bytes.readUInt32LE(offset);
+    if (length !== 4 + count * 16) throw invalid("the evidence length disagrees with its count");
+    let previous = -1;
+    for (let index = 0; index < count; index += 1) {
+      const at = offset + 4 + index * 16;
+      const node = bytes.readUInt32LE(at);
+      if (node >= nodeCount) throw invalid("evidence names a node out of range");
+      if (node <= previous) throw invalid("evidence is not ascending by node index");
+      previous = node;
+      evidence.set(node, {
+        path: text(bytes.readUInt32LE(at + 4)),
+        line: bytes.readUInt32LE(at + 8),
+        column: bytes.readUInt32LE(at + 12),
+      });
+    }
+  }
+
+  return {
+    nodes: Array.from({ length: nodeCount }, (_, index) => ({
+      id: text(nodeIds[index]),
+      label: text(nodeLabels[index]),
+      source: nodeSources[index],
+      evidence: evidence.get(index) ?? null,
+    })),
+    edges: Array.from({ length: edgeCount }, (_, index) => ({
+      from: endpoints[index * 2],
+      to: endpoints[index * 2 + 1],
+      relation: text(relations[index]),
+    })),
+    sources,
+  };
+}
+
+/**
+ * The page. Data is embedded so the file opens from the filesystem: a page fetching a sibling would
+ * be blocked by the browser's origin rules when opened with file://, which is how somebody actually
+ * opens one of these.
+ *
+ * Layout is a deterministic circle per component, not a force simulation. A simulation would look
+ * better and would make the same input render differently on every run, which is the wrong trade for
+ * a reference: what this has to demonstrate is that the data arrived, and a reader comparing two runs
+ * should see the same picture.
+ */
+function page(graph) {
+  const payload = JSON.stringify(graph).replace(/</g, "\\u003c");
+  return `<!doctype html>
+<meta charset="utf-8">
+<title>NostDB graph</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { margin: 0; font: 13px system-ui, sans-serif; }
+  header { padding: .6rem .8rem; border-bottom: 1px solid #8884; display: flex; gap: 1rem; flex-wrap: wrap; }
+  canvas { display: block; width: 100%; height: calc(100vh - 3rem); }
+  #warn { padding: .6rem .8rem; background: #fee; color: #900; }
+  @media (prefers-color-scheme: dark) { #warn { background: #400; color: #fbb; } }
+  b { font-weight: 600; }
+</style>
+<header>
+  <span><b id="n">0</b> nodes</span>
+  <span><b id="e">0</b> edges</span>
+  <span id="src"></span>
+  <span id="hover"></span>
+</header>
+<div id="warn" hidden></div>
+<canvas id="c"></canvas>
+<script type="application/json" id="data">${payload}</script>
+<script>
+const graph = JSON.parse(document.getElementById("data").textContent);
+document.getElementById("n").textContent = graph.nodes.length;
+document.getElementById("e").textContent = graph.edges.length;
+
+// An unavailable link keeps its entry, and a viewer that hid it would report a smaller graph as a
+// complete one.
+const broken = graph.sources.filter((s) => s.status === 1);
+document.getElementById("src").textContent =
+  graph.sources.length + (graph.sources.length === 1 ? " source" : " sources");
+if (broken.length) {
+  const warn = document.getElementById("warn");
+  warn.hidden = false;
+  warn.textContent =
+    broken.length + " declared link(s) could not be reached: " +
+    broken.map((s) => s.alias || s.locator).join(", ") +
+    ". What they hold is missing from this view.";
+}
+
+// Components, found from the edges. Disconnected parts stay disconnected: nothing is added to join
+// them, because the graph does not join them.
+const parent = graph.nodes.map((_, i) => i);
+const find = (i) => (parent[i] === i ? i : (parent[i] = find(parent[i])));
+for (const edge of graph.edges) parent[find(edge.from)] = find(edge.to);
+const components = new Map();
+graph.nodes.forEach((_, i) => {
+  const root = find(i);
+  if (!components.has(root)) components.set(root, []);
+  components.get(root).push(i);
+});
+
+const canvas = document.getElementById("c");
+const context = canvas.getContext("2d");
+const position = new Float32Array(graph.nodes.length * 2);
+
+function layout() {
+  const ratio = window.devicePixelRatio || 1;
+  canvas.width = canvas.clientWidth * ratio;
+  canvas.height = canvas.clientHeight * ratio;
+  context.setTransform(ratio, 0, 0, ratio, 0, 0);
+
+  // One ring per component, laid out on a grid of rings. Deterministic, so two runs of the same
+  // input draw the same picture.
+  const list = [...components.values()];
+  const columns = Math.max(1, Math.ceil(Math.sqrt(list.length)));
+  const cellW = canvas.clientWidth / columns;
+  const cellH = canvas.clientHeight / Math.max(1, Math.ceil(list.length / columns));
+  list.forEach((members, index) => {
+    const cx = (index % columns) * cellW + cellW / 2;
+    const cy = Math.floor(index / columns) * cellH + cellH / 2;
+    const radius = Math.max(12, Math.min(cellW, cellH) / 2 - 24);
+    members.forEach((node, at) => {
+      const angle = (at / members.length) * Math.PI * 2 - Math.PI / 2;
+      position[node * 2] = cx + (members.length === 1 ? 0 : Math.cos(angle) * radius);
+      position[node * 2 + 1] = cy + (members.length === 1 ? 0 : Math.sin(angle) * radius);
+    });
+  });
+}
+
+function draw() {
+  context.clearRect(0, 0, canvas.clientWidth, canvas.clientHeight);
+  context.strokeStyle = "#8886";
+  context.beginPath();
+  for (const edge of graph.edges) {
+    context.moveTo(position[edge.from * 2], position[edge.from * 2 + 1]);
+    context.lineTo(position[edge.to * 2], position[edge.to * 2 + 1]);
+  }
+  context.stroke();
+
+  graph.nodes.forEach((node, index) => {
+    // Coloured by source, so an item from a linked graph is visibly from one.
+    const hue = (node.source * 67) % 360;
+    context.fillStyle = "hsl(" + hue + " 65% 55%)";
+    context.beginPath();
+    context.arc(position[index * 2], position[index * 2 + 1], 5, 0, Math.PI * 2);
+    context.fill();
+    if (graph.nodes.length <= 300) {
+      context.fillStyle = "currentColor";
+      context.fillText(node.label, position[index * 2] + 8, position[index * 2 + 1] + 4);
+    }
+  });
+}
+
+canvas.addEventListener("mousemove", (event) => {
+  const rect = canvas.getBoundingClientRect();
+  const x = event.clientX - rect.left;
+  const y = event.clientY - rect.top;
+  let nearest = -1;
+  let best = 12 * 12;
+  graph.nodes.forEach((_, index) => {
+    const dx = position[index * 2] - x;
+    const dy = position[index * 2 + 1] - y;
+    const distance = dx * dx + dy * dy;
+    if (distance < best) { best = distance; nearest = index; }
+  });
+  const label = document.getElementById("hover");
+  if (nearest < 0) { label.textContent = ""; return; }
+  const node = graph.nodes[nearest];
+  const source = graph.sources[node.source];
+  const where = node.evidence
+    ? " — " + node.evidence.path + ":" + node.evidence.line + ":" + node.evidence.column
+    : "";
+  label.textContent = node.label + " " + node.id + " [" + (source.alias || source.locator) + "]" + where;
+});
+
+function resize() { layout(); draw(); }
+window.addEventListener("resize", resize);
+resize();
+</script>
+`;
+}
+
+// ---- the protocol ----
+
+const send = (message) => process.stdout.write(JSON.stringify(message) + "\n");
+const error = (code, message) =>
+  send({ plugin_protocol_version: PROTOCOL_VERSION, reply: "error", code, message });
+
+function handle(line) {
+  let request;
+  try {
+    request = JSON.parse(line);
+  } catch {
+    return error("PLUGIN_REQUEST_INVALID", "the request is not JSON");
+  }
+
+  if (request.plugin_protocol_version !== PROTOCOL_VERSION) {
+    return error(
+      "PLUGIN_PROTOCOL_UNSUPPORTED",
+      `this build speaks plugin_protocol_version ${PROTOCOL_VERSION}`,
+    );
+  }
+
+  if (request.request === "handshake") {
+    return send({
+      plugin_protocol_version: PROTOCOL_VERSION,
+      reply: "handshake",
+      plugin: NAME,
+      plugin_version: VERSION,
+      actions: ["view"],
+    });
+  }
+
+  if (request.request !== "invoke") {
+    return error("PLUGIN_REQUEST_INVALID", `\`${request.request}\` is not a request kind`);
+  }
+  if (request.action !== "view") {
+    return error("PLUGIN_ACTION_UNKNOWN", "this build implements only `view`");
+  }
+  if (typeof request.output_directory !== "string" || !request.output_directory) {
+    return error("PLUGIN_REQUEST_INVALID", "no output_directory was given");
+  }
+
+  const exchange = request.exchange;
+  if (!exchange) {
+    // graph_read was not approved, so there is nothing to draw. Refused rather than writing an
+    // empty page: an empty page looks like an empty graph.
+    return error("PLUGIN_REQUEST_INVALID", "this action needs graph_read, and no exchange was sent");
+  }
+  if (exchange.kind !== "artifact") {
+    return error("PLUGIN_REQUEST_INVALID", `\`${exchange.kind}\` is not a handoff this build reads`);
+  }
+  // Never inferred from the path's extension. A file named .bin that is not the declared type is a
+  // disagreement worth reporting rather than resolving by guessing.
+  if (exchange.media_type !== MEDIA_TYPE) {
+    return error("PLUGIN_REQUEST_INVALID", `\`${exchange.media_type}\` is not ${MEDIA_TYPE}`);
+  }
+
+  let bytes;
+  try {
+    bytes = readFileSync(exchange.path);
+  } catch (cause) {
+    return error("PLUGIN_FAILED", `the artifact could not be read: ${cause.message}`);
+  }
+  if (bytes.length !== exchange.bytes) {
+    return error("PLUGIN_FAILED", `the artifact is ${bytes.length} bytes and ${exchange.bytes} was declared`);
+  }
+  // The manager stated what it wrote so this can check it. Verified before the bytes are
+  // interpreted, not after.
+  const digest = "sha256:" + createHash("sha256").update(bytes).digest("hex");
+  if (digest !== exchange.content_digest) {
+    return error("PLUGIN_FAILED", "the artifact does not match the digest that was declared");
+  }
+
+  let graph;
+  try {
+    graph = decode(bytes);
+  } catch (cause) {
+    if (cause instanceof Refusal) return error(cause.code, cause.message);
+    return error("PLUGIN_FAILED", cause.message);
+  }
+
+  // A fact about this renderer on this machine, never about the file. The file was fine.
+  if (graph.nodes.length > MAX_DRAWABLE_NODES || graph.edges.length > MAX_DRAWABLE_EDGES) {
+    return error(
+      "VIEW_CAPACITY_EXCEEDED",
+      `this build draws up to ${MAX_DRAWABLE_NODES} nodes and ${MAX_DRAWABLE_EDGES} edges with Canvas, ` +
+        `and was sent ${graph.nodes.length} and ${graph.edges.length}`,
+    );
+  }
+
+  const html = join(request.output_directory, "view.html");
+  const data = join(request.output_directory, "view.data.bin");
+  try {
+    mkdirSync(dirname(html), { recursive: true });
+    writeFileSync(html, page(graph));
+    // The artifact is copied out so it outlives the invocation: the manager removes its temporary
+    // one, and a page that wanted to re-read the data would find nothing.
+    writeFileSync(data, bytes);
+  } catch (cause) {
+    return error("PLUGIN_FAILED", `an output could not be written: ${cause.message}`);
+  }
+
+  send({
+    plugin_protocol_version: PROTOCOL_VERSION,
+    reply: "invoke",
+    status: "complete",
+    outputs: ["view.html", "view.data.bin"],
+  });
+}
+
+createInterface({ input: process.stdin, crlfDelay: Infinity }).on("line", (line) => {
+  if (line.trim()) handle(line);
+});

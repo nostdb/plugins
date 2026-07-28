@@ -1,8 +1,35 @@
 # org.nostdb.view-webgpu
 
-The reference viewer manifest. There is no viewer behind it yet; this exists so an author
-can see a complete, valid manifest and so the manifest contract has something real to
-validate against.
+The reference viewer: a manifest and the executable behind it.
+
+It exists to prove the viewer exchange format carries what a viewer needs, and to give an
+author a complete working plugin to read. Every section of the exchange is decoded and every
+one is used, so a format that had left something out would show up here as something missing.
+
+## What it renders, and what it does not
+
+It draws with **Canvas 2D**. It does not use WebGPU, and does not implement instanced
+rendering, compute-assisted layout, level of detail, clustering, edge aggregation, or label
+culling. It makes **no claim about any performance tier**.
+
+The product contract requires all of those of a viewer meant for large graphs. This is not
+that viewer, and describing it as one would be a promise nobody had measured. What it does
+have is the honest refusal the contract also requires: past what it can draw it reports
+`VIEW_CAPACITY_EXCEEDED` rather than crashing, and that is a fact about this renderer on this
+machine rather than about the file.
+
+Layout is a deterministic ring per connected component rather than a force simulation. A
+simulation would look better and would draw the same input differently on every run, which is
+the wrong trade for a reference: two runs should produce the same picture.
+
+Disconnected components stay disconnected. Nothing is drawn between them, because nothing in
+the exchange format can express a relationship the graph does not have.
+
+## Requirements
+
+Node 22 or newer, which is what runs `bin/nostdb-view`. A plugin's runtime is its own business
+and the manifest says nothing about it — `nostdb` in the manifest is the range of *Engine*
+versions this works with, which is a different question.
 
 ## What each permission here is saying
 
