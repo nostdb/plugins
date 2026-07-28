@@ -51,13 +51,24 @@ Prohibited:
 Every reference manifest must be one the contract accepts, checked against the published
 fixtures rather than by inspection.
 
-No test installs or executes a plugin. Installation must not execute plugin code, and a suite
-that installed one to test installation would be executing the thing the contract exists to
-keep from executing.
+**No test installs a plugin, and no test executes an installed one.** Installation must not
+execute plugin code, and a suite that installed one to test installation would be executing the
+thing the contract exists to keep from executing.
+
+A reference plugin's own suite **may** run the code in this repository, against fixtures it was
+given. That is a different act: nothing is installed, nothing is fetched, and what runs is code
+this repository authored and can read. The rule exists to keep installation from executing a
+stranger's code, not to keep an author from testing their own — and a reference nobody can test
+is one whose correctness is a claim rather than a result.
+
+A reference plugin that reads a published contract must be checked against that contract's
+published fixtures, passed in through `NOSTDB_SPEC_FIXTURES`, and must say so when they are
+absent rather than reporting a pass it did not earn.
 
 ## Safety and external actions
 
-- Never execute a plugin's code here.
+- Never execute an *installed* plugin here. A reference plugin's own suite may run the code in
+  this repository; see the testing expectations above.
 - Never place a credential in a manifest, an example, or a fixture.
 - Do not create remote repositories, add remotes, push to a new remote, publish packages,
   create releases, or modify registries without explicit user authorization.

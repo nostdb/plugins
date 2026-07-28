@@ -48,9 +48,28 @@ if ! head -1 "$viewer" | grep -q '^#!'; then
 fi
 if command -v node >/dev/null 2>&1; then
   node --check "$viewer" || { echo "$viewer does not parse" >&2; exit 1; }
-  echo "reference viewer: parses, and is executable"
+
+  # And run it. Nothing is installed and nothing is fetched: what runs is code this repository
+  # authored, against the published fixtures the superproject passes in through
+  # NOSTDB_SPEC_FIXTURES. A reference nobody can test is one whose correctness is a claim rather
+  # than a result.
+  #
+  # The suite says so when the fixtures are absent, and the container half is then skipped. It is
+  # not treated as a pass here either: root verification is where they are always present.
+  # Inside the superproject the fixtures are a sibling, so a local run of this verifier checks the
+  # containers without anybody having to know the variable exists. Cloned on its own there is no
+  # sibling, and the suite skips and says so — which is the honest outcome rather than a silent one.
+  if [ -z "${NOSTDB_SPEC_FIXTURES:-}" ] && [ -d ../nostdb-spec/fixtures ]; then
+    NOSTDB_SPEC_FIXTURES=$(cd ../nostdb-spec/fixtures && pwd)
+    export NOSTDB_SPEC_FIXTURES
+  fi
+
+  if ! node reference/view-webgpu/test/viewer.test.mjs; then
+    echo "the reference viewer's own suite failed" >&2
+    exit 1
+  fi
 else
-  echo "reference viewer: node is absent, so it was not parsed" >&2
+  echo "reference viewer: node is absent, so it was neither parsed nor run" >&2
 fi
 
 # A viewer that claimed WebGPU or a performance tier would be claiming something nobody measured.
