@@ -15,6 +15,20 @@ conflict is recorded in the root `IMPLEMENTATION_PROGRESS.md`.
 Write everything in this repository in English only, regardless of the language a request is
 written in.
 
+## Repository layout
+
+A plugin lives at `plugins/<directory>/`, with `nostdb-plugin.json` at its own top level, and every
+plugin is declared in `nostdb.plugins.json` at the repository root.
+
+The index is what makes this repository installable: `plugin_install_version` 2 recognises a plugin
+source by that file rather than by finding a manifest somewhere inside a tree. A plugin on disk that
+the index does not declare is one nobody can install, and everything else about it looks right — so
+`scripts/verify-repository.sh` refuses both directions, an index naming a directory that is not there
+and a directory the index does not name.
+
+The name in the index is what a caller's `#fragment` writes. It need not equal the manifest's declared
+name, and the manifest's name is still what an installation records.
+
 ## Ownership boundary
 
 This repository holds the authoring surface: guidance, reference manifests, and reference

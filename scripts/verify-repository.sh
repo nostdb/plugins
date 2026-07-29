@@ -31,13 +31,82 @@ if [ -e docs/PRD.md ] || [ -e grammar ] || [ -e fixtures ]; then
   exit 1
 fi
 
+# The index, and the layout it declares.
+#
+# `plugin_install_version` 2 recognises a plugin repository by `nostdb.plugins.json` rather than by
+# finding a `nostdb-plugin.json` somewhere inside it. So the index is what makes this repository
+# installable at all, and a plugin that is not in it is one nobody can install from here — which is
+# exactly the state a checker has to refuse, because everything else about such a plugin looks right.
+index=nostdb.plugins.json
+if [ ! -f "$index" ]; then
+  echo "$index must exist; without it no engine recognises this repository as a plugin source" >&2
+  exit 1
+fi
+if command -v node >/dev/null 2>&1; then
+  node - "$index" <<'NODE' || exit 1
+const fs = require("node:fs");
+const path = require("node:path");
+const file = process.argv[2];
+let index;
+try {
+  index = JSON.parse(fs.readFileSync(file, "utf8"));
+} catch (error) {
+  console.error(`${file} is not JSON: ${error.message}`);
+  process.exit(1);
+}
+if (index.plugin_install_version !== 2) {
+  console.error(`${file} declares plugin_install_version ${index.plugin_install_version}; this layout is 2`);
+  process.exit(1);
+}
+const declared = index.plugins;
+if (!declared || typeof declared !== "object" || Array.isArray(declared)) {
+  console.error(`${file} must map a name to a directory`);
+  process.exit(1);
+}
+const names = Object.keys(declared);
+if (names.length === 0) {
+  console.error(`${file} declares no plugin, so this repository publishes none`);
+  process.exit(1);
+}
+let failed = false;
+for (const [name, directory] of Object.entries(declared)) {
+  if (!name) {
+    console.error(`${file} maps an empty name, which no source's fragment can write`);
+    failed = true;
+  }
+  // Under `plugins/`, because that is where this repository keeps them and a checker that accepted
+  // any path would let the layout drift one plugin at a time.
+  if (!directory.startsWith("plugins/")) {
+    console.error(`${name} maps to ${directory}; a plugin here lives under plugins/`);
+    failed = true;
+  }
+  if (!fs.existsSync(path.join(directory, "nostdb-plugin.json"))) {
+    console.error(`${name} maps to ${directory}, which holds no nostdb-plugin.json`);
+    failed = true;
+  }
+}
+// And the other direction: a plugin on disk that the index does not declare is one nobody can
+// install, and nothing else about it would look wrong.
+for (const entry of fs.existsSync("plugins") ? fs.readdirSync("plugins") : []) {
+  const directory = path.join("plugins", entry);
+  if (!fs.statSync(directory).isDirectory()) continue;
+  if (!Object.values(declared).includes(directory)) {
+    console.error(`${directory} exists and ${file} does not declare it, so nothing can install it`);
+    failed = true;
+  }
+}
+process.exit(failed ? 1 : 0);
+NODE
+  echo "index: $(node -e 'const d=require("./nostdb.plugins.json").plugins;console.log(Object.keys(d).length+" plugin(s) declared, each under plugins/")')"
+fi
+
 # The reference viewer is an executable, so it can be wrong in ways a manifest cannot.
 #
 # Checked by parsing rather than by running. This repository must never execute a plugin's code,
 # and that rule is not relaxed for the one plugin it happens to own: a rule that holds except for
 # the code you wrote yourself is not a rule. What that leaves unverified is recorded in the root
 # IMPLEMENTATION_PROGRESS.md rather than papered over.
-viewer=reference/view-webgpu/bin/nostdb-view
+viewer=plugins/view-webgpu/bin/nostdb-view
 if [ ! -x "$viewer" ]; then
   echo "$viewer must be committed executable; an entrypoint nothing can start is not one" >&2
   exit 1
@@ -64,7 +133,7 @@ if command -v node >/dev/null 2>&1; then
     export NOSTDB_SPEC_FIXTURES
   fi
 
-  if ! node reference/view-webgpu/test/viewer.test.mjs; then
+  if ! node plugins/view-webgpu/test/viewer.test.mjs; then
     echo "the reference viewer's own suite failed" >&2
     exit 1
   fi
@@ -74,11 +143,11 @@ fi
 
 # A viewer that claimed WebGPU or a performance tier would be claiming something nobody measured.
 # The positive form again: the document a user reads must say what it does not do.
-if ! grep -q 'Canvas 2D' reference/view-webgpu/README.md; then
+if ! grep -q 'Canvas 2D' plugins/view-webgpu/README.md; then
   echo "the reference viewer must say what it renders with" >&2
   exit 1
 fi
-if ! grep -q 'no claim about any performance tier' reference/view-webgpu/README.md; then
+if ! grep -q 'no claim about any performance tier' plugins/view-webgpu/README.md; then
   echo "the reference viewer must state that it claims no performance tier" >&2
   exit 1
 fi

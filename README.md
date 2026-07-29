@@ -18,7 +18,9 @@ receives graph data through a versioned Engine-owned exchange instead.
 ## Start here
 
 - [`AUTHORING.md`](AUTHORING.md) — what a plugin is, what it gets, and what it never gets
-- [`reference/view-webgpu/`](reference/view-webgpu/) — a complete, valid manifest with each
+- [`nostdb.plugins.json`](nostdb.plugins.json) — the index that makes this repository a plugin
+  source, mapping each name a caller writes to the directory it lives in
+- [`plugins/view-webgpu/`](plugins/view-webgpu/) — a complete, valid manifest with each
   permission explained
 - the manifest contract itself, in
   [`nostdb-spec/docs/PLUGIN_MANIFEST.md`](https://github.com/nostdb/nostdb-spec/blob/main/docs/PLUGIN_MANIFEST.md)

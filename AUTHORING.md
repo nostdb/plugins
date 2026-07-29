@@ -55,7 +55,7 @@ State both honestly. A range wider than you have tested is a promise you have no
 A plugin is installed from GitHub:
 
 ```text
-https://github.com/<owner>/<repository>?ref=<git-ref>[#<subdirectory>]
+https://github.com/<owner>/<repository>?ref=<git-ref>[#<name>]
 ```
 
 The ref is **required**, and it is resolved once to a commit. Your users do not follow your
@@ -66,7 +66,31 @@ So publish a tag and tell people to install it by name. `?ref=v1.2.0` in an inst
 a record of what somebody got that they can read without opening a lock file; `?ref=main` is a
 commit they will not be able to identify later without one.
 
-One repository may hold several plugins, each in its own subdirectory.
+### Declare your plugins in an index
+
+Your repository root MUST hold `nostdb.plugins.json`. Without it no engine recognises the repository as
+a plugin source, whatever else is in it:
+
+```json
+{
+  "plugin_install_version": 2,
+  "plugins": {
+    "view-webgpu": "plugins/view-webgpu"
+  }
+}
+```
+
+The fragment in an install command names a **key in that file**, not a directory. So `#view-webgpu`
+installs whatever `view-webgpu` maps to, and you can move the directory without changing the command
+anybody published. A repository declaring exactly one plugin needs no fragment at all.
+
+One repository may hold several plugins, each in its own directory and each declared here. A plugin on
+disk that the index does not name is one nobody can install — which is a state where everything about
+your plugin looks right and nothing works, so declare it as you add it.
+
+The name you choose here is what a caller writes. It does not have to equal the `name` in your
+manifest, and the manifest's name is still what an installation records — the index says what to fetch,
+the manifest says what was installed.
 
 ## What installation does, and does not do
 
