@@ -26,8 +26,14 @@ import { createInterface } from "node:readline";
 const PROTOCOL_VERSION = 1;
 const EXCHANGE_VERSION = 1;
 const MEDIA_TYPE = "application/vnd.nostdb.view+bin";
+// Both duplicate `nostdb-plugin.json`, and the repository verifier requires them to agree.
+//
+// The version drifted the moment the manifest was bumped and nothing noticed: an install reported
+// `0.1.3` and the render reported `0.1.0`, in the same session, two lines apart. Read from the manifest
+// at startup instead would remove the duplication outright; a check keeps the constant and makes the
+// drift impossible to land, which is the same trade the diagnostic-severity registry takes.
 const NAME = "org.nostdb.view-webgpu";
-const VERSION = "0.1.0";
+const VERSION = "0.1.3";
 const MAGIC = "NOSTVIEW";
 
 // What this build will draw. Beyond it the contract requires VIEW_CAPACITY_EXCEEDED rather than a

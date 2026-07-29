@@ -100,6 +100,33 @@ NODE
   echo "index: $(node -e 'const d=require("./nostdb.plugins.json").plugins;console.log(Object.keys(d).length+" plugin(s) declared, each under plugins/")')"
 fi
 
+# The viewer's own `NAME` and `VERSION` must equal its manifest's.
+#
+# They are two copies of one fact, and the version drifted the moment the manifest was bumped: an install
+# reported one number and the render reported another, in the same session. A viewer that misreports its
+# version reports it into the exchange stream, where a caller has no other source for it.
+if command -v node >/dev/null 2>&1; then
+  node - <<'NODE' || exit 1
+const fs = require("node:fs");
+const manifest = JSON.parse(fs.readFileSync("plugins/view-webgpu/nostdb-plugin.json", "utf8"));
+const source = fs.readFileSync("plugins/view-webgpu/bin/nostdb-view", "utf8");
+const literal = (name) => {
+  const found = source.match(new RegExp(`^const ${name} = "([^"]*)";`, "m"));
+  return found?.[1];
+};
+let failed = false;
+for (const [name, wanted] of [["NAME", manifest.name], ["VERSION", manifest.version]]) {
+  const found = literal(name);
+  if (found !== wanted) {
+    console.error(`bin/nostdb-view declares ${name} = ${found} and the manifest says ${wanted}`);
+    failed = true;
+  }
+}
+if (failed) process.exit(1);
+console.log(`viewer identity: ${manifest.name} ${manifest.version} agrees with its manifest`);
+NODE
+fi
+
 # The reference viewer is an executable, so it can be wrong in ways a manifest cannot.
 #
 # Checked by parsing rather than by running. This repository must never execute a plugin's code,
