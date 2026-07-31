@@ -1,7 +1,7 @@
 {
   "manifest_version": 1,
   "name": "org.nostdb.view-webgpu",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "nostdb": ">=0.1.0 <0.2.0",
   "entrypoint": {
     "command": ["bin/nostdb-view"]
